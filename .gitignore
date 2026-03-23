@@ -1,15 +1,32 @@
 # Python
 __pycache__/
 *.py[cod]
+*$py.class
 *.egg-info/
+*.egg
 dist/
 build/
-*.egg
+*.whl
 
 # Virtual environments
 .venv/
 venv/
+env/
 
 # IDE
 .vscode/
 .idea/
+*.swp
+*.swo
+*~
+
+# OS
+.DS_Store
+Thumbs.db
+
+# Gaussian scratch files
+*.chk
+*.rwf
+
+# AutoPrep working directories (generated output)
+*.autoprep_meta.json
