@@ -1,0 +1,19 @@
+[build-system]
+requires = ["setuptools>=64"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "autoprep"
+version = "0.1.0"
+description = "Automated non-standard amino acid parameterization for Amber"
+requires-python = ">=3.8"
+dependencies = ["numpy"]
+
+[project.scripts]
+autoprep = "autoprep.cli:main"
+
+[tool.setuptools.packages.find]
+where = ["."]
+
+[tool.setuptools.package-data]
+autoprep = ["template/*.xyz"]

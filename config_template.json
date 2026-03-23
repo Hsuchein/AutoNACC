@@ -1,0 +1,38 @@
+{
+    "_说明": "autoprep 配置模板 — ace/nme模板及其索引已内置, 无需指定.",
+
+    "residue_file": "my_residue.pdb",
+
+    "_索引说明": "所有索引从 0 开始. 运行时 Step1 会打印残基原子表供核对.",
+
+    "backbone_n_idx": 0,
+    "_backbone_n": "残基中主链氮原子 N 的索引 (该N有自由价, 将与ACE的C=O连接)",
+
+    "backbone_c_idx": 2,
+    "_backbone_c": "残基中主链羰基碳 C 的索引 (该C有自由价, 将与NME的N连接)",
+
+    "residue_name": "RES",
+    "net_charge": 0,
+    "residue_charge": 0,
+    "_charge": "net_charge = 整个ACE-RES-NME的电荷; residue_charge = 残基本身电荷 (通常相等)",
+
+    "multiplicity": 1,
+
+    "gaussian_cmd": "g16",
+    "nproc": 16,
+    "mem": "64GB",
+    "opt_method": "wB97XD/6-31G*",
+    "_opt": "结构优化方法",
+    "resp_method": "HF/6-31G*",
+    "_resp": "RESP电荷拟合用的单点ESP方法 (标准为HF/6-31G*)",
+
+    "check_interval": 60,
+    "_interval": "Gaussian状态检查间隔(秒)",
+
+    "antechamber": "antechamber",
+    "prepgen": "prepgen",
+    "parmchk2": "parmchk2",
+
+    "mainchain_names": [],
+    "_mc": "留空=自动检测[N,CA,C]. 若自动检测不对, 填入antechamber分配的原子名"
+}
