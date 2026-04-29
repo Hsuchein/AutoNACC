@@ -949,7 +949,89 @@ def run_pipeline(cfg, workdir):
         res_file = cfg["residue_file"]
         if not os.path.isabs(res_file):
             res_file = os.path.abspath(res_file)
-        res_e, res_c, res_n = read_structure(res_file)
+        if cfg.get("precapped", False):
+            # In precapped mode, residue_file IS the full ACE-RES-NME PDB
+            res_e, res_c, res_n = read_structure(res_file)
+            # Slice to RES portion only for downstream code that needs res_e
+            res_e = res_e[na:na+nr]
+            res_c = res_c[na:na+nr]
+            res_n = res_n[na:na+nr] if res_n else None
+        else:
+            res_e, res_c, res_n = read_structure(res_file)
+    elif cfg.get("precapped", False):
+        # ★ Precapped mode: input PDB already contains ACE+RES+NME with proper labels
+        print("\n[Step 1-2] PRECAPPED 模式 — 跳过 ACE/NME 自动加帽")
+        res_file = cfg["residue_file"]
+        if not os.path.isabs(res_file):
+            res_file = os.path.abspath(res_file)
+
+        all_e, all_c, all_n = read_structure(res_file)
+
+        # Identify segment by residue name (need to re-read with PDB parser)
+        seg_labels = []
+        atom_names = []
+        with open(res_file) as f:
+            for line in f:
+                if line.startswith(("ATOM", "HETATM")):
+                    resname = line[17:20].strip().upper()
+                    aname = line[12:16].strip()
+                    seg_labels.append(resname)
+                    atom_names.append(aname)
+        if len(seg_labels) != len(all_e):
+            raise RuntimeError(
+                f"precapped: parsed {len(seg_labels)} atoms from PDB but "
+                f"read_structure gave {len(all_e)} atoms")
+
+        # Group consecutive ACE / RES / NME segments
+        # Expected order: ACE first, RES middle, NME last
+        ace_idx = [i for i, s in enumerate(seg_labels) if s == "ACE"]
+        nme_idx = [i for i, s in enumerate(seg_labels) if s == "NME"]
+        res_idx = [i for i, s in enumerate(seg_labels) if s not in ("ACE", "NME")]
+        if not ace_idx or not res_idx or not nme_idx:
+            raise RuntimeError(
+                f"precapped: PDB must contain ACE, RES (any name), NME residues. "
+                f"Got: {set(seg_labels)}")
+        if not (max(ace_idx) < min(res_idx) and max(res_idx) < min(nme_idx)):
+            raise RuntimeError(
+                "precapped: atoms must be ordered ACE → RES → NME (group together).")
+
+        na, nr, nn = len(ace_idx), len(res_idx), len(nme_idx)
+
+        # Identify backbone N and C in RES section by atom name
+        bb_n_atom = cfg.get("backbone_n_atom_name", "N1")
+        bb_c_atom = cfg.get("backbone_c_atom_name", "C4")
+        res_atom_names = [atom_names[i] for i in res_idx]
+        try:
+            bb_n_in_res = res_atom_names.index(bb_n_atom)
+            bb_c_in_res = res_atom_names.index(bb_c_atom)
+        except ValueError:
+            raise RuntimeError(
+                f"precapped: backbone_n_atom_name='{bb_n_atom}' or "
+                f"backbone_c_atom_name='{bb_c_atom}' not found in RES atoms: "
+                f"{res_atom_names}")
+
+        print(f"  解析: ACE={na}  RES={nr}  NME={nn}  总={na+nr+nn} 原子")
+        print(f"  backbone N atom: '{bb_n_atom}' (RES idx {bb_n_in_res})")
+        print(f"  backbone C atom: '{bb_c_atom}' (RES idx {bb_c_in_res})")
+
+        # Copy input PDB to capped.pdb (autoprep expected name) + write xyz
+        import shutil
+        shutil.copy2(res_file, pdb_out)
+        write_xyz(xyz_raw, all_e, all_c, f"ACE-{rn}-NME (precapped)")
+        print(f"  保存: {pdb_out}")
+        print(f"  保存: {xyz_raw}")
+
+        _save_meta(workdir, {
+            "n_ace": na, "n_res": nr, "n_nme": nn,
+            "bb_n_in_res": bb_n_in_res,
+            "bb_c_in_res": bb_c_in_res,
+        })
+        meta = _load_meta(workdir)
+
+        # Slice res_* for downstream
+        res_e = [all_e[i] for i in res_idx]
+        res_c = [all_c[i] for i in res_idx]
+        res_n = [all_n[i] for i in res_idx] if all_n else None
     else:
         print("\n[Step 1] 读取输入 ...")
         res_file = cfg["residue_file"]
