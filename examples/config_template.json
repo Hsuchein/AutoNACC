@@ -19,10 +19,16 @@
     "multiplicity": 1,
 
     "gaussian_cmd": "g16",
+    "_gaussian": "Gaussian 可执行文件名或路径 (Gaussian 后端)",
+    "orca_cmd": "orca",
+    "_orca": "ORCA 可执行文件名或路径 (ORCA 后端)",
+    "multiwfn_cmd": "Multiwfn",
+    "_multiwfn": "Multiwfn 可执行文件名或路径 (ORCA 后端 RESP 拟合)",
+
     "nproc": 16,
     "mem": "64GB",
     "opt_method": "wB97XD/6-31G*",
-    "_opt": "结构优化方法",
+    "_opt": "结构优化方法 (Gaussian: wB97XD/6-31G*, ORCA: wB97X-D3 6-31G*)",
     "resp_method": "HF/6-31G*",
     "_resp": "RESP电荷拟合用的单点ESP方法 (标准为HF/6-31G*)",
 

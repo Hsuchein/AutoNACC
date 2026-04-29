@@ -34,7 +34,7 @@ def _cmd_run(args):
         cfg["residue_file"] = os.path.join(cfg_dir, res_file)
 
     from autoprep.prep import run_pipeline
-    run_pipeline(cfg, workdir)
+    run_pipeline(cfg, workdir, backend=args.backend)
 
 
 def _cmd_prot(args):
@@ -87,6 +87,9 @@ def main():
     p_run.add_argument("config", help="配置文件 (JSON)")
     p_run.add_argument("-o", "--outdir", default=None,
                        help="输出目录 (默认: <residue_name>_prep)")
+    p_run.add_argument("--backend", choices=["gaussian", "orca"],
+                       default=None,
+                       help="QM 后端 (默认: 自动检测)")
 
     # --- autoprep norm ---
     p_norm = sub.add_parser("norm", help="规范化 PDB 文件")

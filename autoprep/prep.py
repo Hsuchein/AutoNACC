@@ -409,6 +409,191 @@ def optimize_mmff(xyz_path, out_path, charge=0, max_iters=500):
 
 
 # =============================================================================
+# ORCA
+# =============================================================================
+
+def write_orca_opt_input(path, elems, coords, cfg):
+    """生成 ORCA 几何优化输入文件."""
+    chg = cfg["net_charge"]
+    mult = cfg.get("multiplicity", 1)
+    nproc = cfg.get("nproc", 4)
+    mem_mb = int(cfg.get("mem", "4GB").replace("GB", "")) * 1000 // nproc
+
+    with open(path, 'w') as f:
+        f.write("! wB97X-D3 6-31G* Opt TightSCF\n")
+        f.write(f"%pal nprocs {nproc} end\n")
+        f.write(f"%maxcore {mem_mb}\n")
+        f.write("%geom\n  MaxIter 200\nend\n")
+        f.write("%scf\n  MaxIter 300\n  ConvForced true\nend\n\n")
+        f.write(f"* xyz {chg} {mult}\n")
+        for e, (x, y, z) in zip(elems, coords):
+            f.write(f"  {e:<2s}  {x:14.8f}  {y:14.8f}  {z:14.8f}\n")
+        f.write("*\n")
+
+
+def write_orca_esp_input(path, elems, coords, cfg):
+    """生成 ORCA HF/6-31G* ESP 单点输入 (用于 Multiwfn RESP)."""
+    chg = cfg["net_charge"]
+    mult = cfg.get("multiplicity", 1)
+    nproc = cfg.get("nproc", 4)
+    mem_mb = int(cfg.get("mem", "4GB").replace("GB", "")) * 1000 // nproc
+
+    with open(path, 'w') as f:
+        f.write("! HF 6-31G* TightSCF\n")
+        f.write("! PrintBasis\n")
+        f.write(f"%pal nprocs {nproc} end\n")
+        f.write(f"%maxcore {mem_mb}\n")
+        f.write("%scf\n  MaxIter 300\n  ConvForced true\nend\n")
+        f.write("%output\n  Print[P_MOs] 1\nend\n\n")
+        f.write(f"* xyz {chg} {mult}\n")
+        for e, (x, y, z) in zip(elems, coords):
+            f.write(f"  {e:<2s}  {x:14.8f}  {y:14.8f}  {z:14.8f}\n")
+        f.write("*\n")
+
+
+def run_orca(inp_file, cfg):
+    """运行 ORCA 计算, 返回 .out 文件路径."""
+    orca_cmd = cfg.get("orca_cmd", "orca")
+    cwd = os.path.dirname(os.path.abspath(inp_file))
+    out_file = os.path.splitext(inp_file)[0] + ".out"
+    print(f"  [RUN] {orca_cmd} {os.path.basename(inp_file)}")
+    r = sp.run([orca_cmd, os.path.abspath(inp_file)],
+               capture_output=True, text=True, cwd=cwd,
+               timeout=86400)
+    with open(out_file, 'w') as f:
+        f.write(r.stdout)
+    return out_file
+
+
+def _orca_done(out_file):
+    """检查 ORCA 是否正常结束."""
+    if os.path.exists(out_file) and os.path.getsize(out_file) > 0:
+        with open(out_file) as f:
+            content = f.read()
+        if "ORCA TERMINATED NORMALLY" in content:
+            return True
+    return False
+
+
+def _ensure_molden(out_base, cfg):
+    """确保 molden 文件存在, 必要时用 orca_2mkl 转换.
+
+    ORCA 6 不再自动生成 .molden.input, 需要用 orca_2mkl 从 .gbw 转换.
+    """
+    molden = out_base + ".molden.input"
+    if os.path.exists(molden):
+        return molden
+    gbw = out_base + ".gbw"
+    if not os.path.exists(gbw):
+        return None
+    # 查找 orca_2mkl: 同目录或 PATH
+    orca_cmd = cfg.get("orca_cmd", "orca")
+    import shutil
+    orca_2mkl = shutil.which("orca_2mkl")
+    if not orca_2mkl and os.path.isabs(orca_cmd):
+        candidate = os.path.join(os.path.dirname(orca_cmd), "orca_2mkl")
+        if os.path.isfile(candidate) and os.access(candidate, os.X_OK):
+            orca_2mkl = candidate
+    if not orca_2mkl:
+        # 尝试与 orca 同目录
+        import shutil as sh
+        orca_path = sh.which(orca_cmd)
+        if orca_path:
+            candidate = os.path.join(os.path.dirname(orca_path), "orca_2mkl")
+            if os.path.isfile(candidate):
+                orca_2mkl = candidate
+    if not orca_2mkl:
+        print("  [WARNING] orca_2mkl 未找到, 无法转换 .gbw → .molden.input")
+        return None
+    print(f"  转换 .gbw → .molden.input (via orca_2mkl) ...")
+    sp.run([orca_2mkl, out_base, "-molden"],
+           capture_output=True, text=True,
+           cwd=os.path.dirname(out_base), timeout=120)
+    if os.path.exists(molden):
+        return molden
+    return None
+
+
+def run_multiwfn_resp(molden_file, cfg, workdir):
+    """运行 Multiwfn 两阶段 RESP 拟合, 返回 {0-indexed: charge} 字典.
+
+    Multiwfn 交互序列: 7(Population) → 18(RESP) → 1(标准两阶段) → y → 文件名 → 0 → q
+    """
+    import re
+    mwfn_cmd = cfg.get("multiwfn_cmd", "Multiwfn")
+    nproc = cfg.get("nproc", 4)
+    chg_file = os.path.join(workdir, "resp_charges.chg")
+
+    mwfn_input = "7\n18\n1\ny\nresp_charges.chg\n0\nq\n"
+    env = os.environ.copy()
+    env["OMP_STACKSIZE"] = "200M"
+    env["OMP_NUM_THREADS"] = str(nproc)
+
+    print(f"  [RUN] {mwfn_cmd} {os.path.basename(molden_file)}")
+    proc = sp.run([mwfn_cmd, molden_file], input=mwfn_input,
+                  capture_output=True, text=True, env=env,
+                  cwd=workdir, timeout=7200)
+    log_file = os.path.join(workdir, "multiwfn_resp.log")
+    with open(log_file, 'w') as f:
+        f.write(proc.stdout)
+        if proc.stderr:
+            f.write("\n=== STDERR ===\n" + proc.stderr)
+
+    # 解析电荷 (3 种模式回退)
+    charges = {}
+    # 方式1: resp_charges.chg 文件
+    if os.path.exists(chg_file):
+        with open(chg_file) as f:
+            for line in f:
+                parts = line.split()
+                if len(parts) >= 3:
+                    try:
+                        charges[int(parts[0]) - 1] = float(parts[2])
+                    except (ValueError, IndexError):
+                        pass
+        if charges:
+            print(f"  从 resp_charges.chg 读取 {len(charges)} 个电荷")
+            return charges
+
+    # 方式2: stdout 中 "N(X )  charge" 模式 (取最后一个 block = Stage 2)
+    pattern = r'^\s+(\d+)\((\w+)\s*\)\s+(-?\d+\.\d+)'
+    all_blocks, cur = [], {}
+    for line in proc.stdout.split("\n"):
+        m = re.match(pattern, line)
+        if m:
+            cur[int(m.group(1)) - 1] = float(m.group(3))
+        elif cur and len(cur) > 5:
+            all_blocks.append(cur)
+            cur = {}
+    if cur and len(cur) > 5:
+        all_blocks.append(cur)
+    if all_blocks:
+        charges = all_blocks[-1]
+        print(f"  从 stdout Stage 2 解析 {len(charges)} 个电荷")
+        return charges
+
+    print("  [ERROR] 无法从 Multiwfn 输出解析 RESP 电荷!")
+    return None
+
+
+def detect_backend(cfg):
+    """自动检测可用的 QM 后端. 返回 'gaussian' 或 'orca'."""
+    import shutil
+    # 检查 Gaussian
+    g_cmd = cfg.get("gaussian_cmd", "g16")
+    if shutil.which(g_cmd):
+        return "gaussian"
+    if shutil.which("g09"):
+        return "gaussian"
+    # 检查 ORCA + Multiwfn
+    orca_cmd = cfg.get("orca_cmd", "orca")
+    mwfn_cmd = cfg.get("multiwfn_cmd", "Multiwfn")
+    if shutil.which(orca_cmd) and shutil.which(mwfn_cmd):
+        return "orca"
+    return None
+
+
+# =============================================================================
 # Gaussian
 # =============================================================================
 
@@ -911,18 +1096,37 @@ def _load_meta(workdir):
 # 主流程
 # =============================================================================
 
-def run_pipeline(cfg, workdir):
-    """执行完整参数化流程, 支持断点续跑."""
+def run_pipeline(cfg, workdir, backend=None):
+    """执行完整参数化流程, 支持断点续跑.
+
+    Args:
+        cfg: 配置字典
+        workdir: 工作目录
+        backend: QM 后端 ('gaussian', 'orca', 或 None=自动检测)
+    """
     rn = cfg["residue_name"]
     os.makedirs(workdir, exist_ok=True)
 
-    opt_method = cfg.get("opt_method", "wB97XD/6-31G*")
+    # 确定 QM 后端
+    if backend is None:
+        backend = detect_backend(cfg)
+        if backend is None:
+            print("[ERROR] 未检测到可用的 QM 后端!")
+            print("  Gaussian: 需要 g16 或 g09 在 PATH 中")
+            print("  ORCA:     需要 orca 和 Multiwfn 在 PATH 中")
+            sys.exit(1)
+        print(f"  自动检测后端: {backend}")
+
+    if backend == "orca":
+        opt_method = cfg.get("opt_method", "wB97X-D3/6-31G*")
+    else:
+        opt_method = cfg.get("opt_method", "wB97XD/6-31G*")
     resp_method = cfg.get("resp_method", "HF/6-31G*")
 
     print("=" * 60)
     print("  autoprep - 非标准氨基酸自动参数化")
     print(f"  残基: {rn}   电荷: {cfg['net_charge']}")
-    print(f"  优化: {opt_method}   RESP: {resp_method}")
+    print(f"  后端: {backend}   优化: {opt_method}   RESP: {resp_method}")
     print(f"  工作目录: {workdir}")
     print("=" * 60)
 
@@ -1082,54 +1286,165 @@ def run_pipeline(cfg, workdir):
             print("  使用原始组装坐标继续")
 
     # ==========================================================
-    # Step 4: Gaussian 输入
+    # Step 4-6: QM 计算 + RESP (按后端分派)
     # ==========================================================
-    if os.path.exists(com):
-        print(f"\n[Step 4] 跳过 (已有 {rn}.com)")
-    else:
-        print(f"\n[Step 4] Gaussian 输入 (Opt + --Link1-- SP ESP) ...")
-        elems, coords = read_xyz(xyz_mmff)
-        write_gaussian_input(com, elems, coords, cfg)
-        print(f"  文件: {com}")
-        print(f"  Job1: Opt {opt_method}")
-        print(f"  Job2: SP  {resp_method} Pop=MK IOp(6/33=2)")
-        print(f"  nproc={cfg.get('nproc', 16)}  mem={cfg.get('mem', '64GB')}")
+    if backend == "orca":
+        # --- ORCA 后端 ---
+        orca_opt_inp = os.path.join(workdir, f"{rn}_opt.inp")
+        orca_opt_out = os.path.join(workdir, f"{rn}_opt.out")
+        orca_opt_xyz = os.path.join(workdir, f"{rn}_opt.xyz")
+        orca_esp_inp = os.path.join(workdir, f"{rn}_esp.inp")
+        orca_esp_out = os.path.join(workdir, f"{rn}_esp.out")
+        orca_esp_base = os.path.join(workdir, f"{rn}_esp")
 
-    # ==========================================================
-    # Step 5: 运行 Gaussian
-    # ==========================================================
-    done, actual_log = _gaussian_done(log)
-    if done:
-        print(f"\n[Step 5] 跳过 (Gaussian 已正常结束: {os.path.basename(actual_log)})")
-    else:
-        print(f"\n[Step 5] 运行 Gaussian ...")
-        if os.path.exists(log) and os.path.getsize(log) > 0:
-            content = open(log).read()
-            if "Error termination" in content:
-                print(f"  检测到上次 Error termination, 删除旧 log 重新提交 ...")
-                os.remove(log)
-                chk = log.replace('.log', '.chk')
-                if os.path.exists(chk):
-                    os.remove(chk)
-        actual_log = run_gaussian(com, cfg)
-        ok, actual_log = monitor_gaussian(actual_log, cfg.get("check_interval", 60))
-        if not ok:
-            print("Gaussian 失败, 请检查后重新运行.")
+        # Step 4: ORCA 几何优化
+        if _orca_done(orca_opt_out):
+            print(f"\n[Step 4] 跳过 (ORCA 优化已完成)")
+        else:
+            print(f"\n[Step 4] ORCA 几何优化 ({opt_method}) ...")
+            elems, coords = read_xyz(xyz_mmff)
+            write_orca_opt_input(orca_opt_inp, elems, coords, cfg)
+            run_orca(orca_opt_inp, cfg)
+            if _orca_done(orca_opt_out):
+                print("  ORCA 优化收敛!")
+            else:
+                print("  [WARNING] ORCA 优化可能未收敛, 检查输出.")
+
+        # Step 5: ORCA ESP 单点
+        if _orca_done(orca_esp_out):
+            print(f"\n[Step 5] 跳过 (ORCA ESP 已完成)")
+        else:
+            print(f"\n[Step 5] ORCA ESP 单点 ({resp_method}) ...")
+            if not os.path.exists(orca_opt_xyz):
+                print("  [ERROR] 优化 xyz 不存在!")
+                sys.exit(1)
+            opt_elems, opt_coords = read_xyz(orca_opt_xyz)
+            write_orca_esp_input(orca_esp_inp, opt_elems, opt_coords, cfg)
+            run_orca(orca_esp_inp, cfg)
+            if _orca_done(orca_esp_out):
+                print("  ESP 计算完成!")
+            else:
+                print("  [WARNING] ORCA ESP 可能失败, 检查输出.")
+
+        # 确保 molden 文件存在
+        molden = _ensure_molden(orca_esp_base, cfg)
+        if molden is None:
+            print("  [ERROR] 无法获取 molden 文件用于 RESP 拟合!")
             sys.exit(1)
 
-    # ==========================================================
-    # Step 6: antechamber RESP
-    # ==========================================================
-    if os.path.exists(ac_file):
-        print(f"\n[Step 6] 跳过 (已有 {rn}.ac)")
+        # Step 6: Multiwfn RESP
+        if os.path.exists(ac_file):
+            print(f"\n[Step 6] 跳过 (已有 {rn}.ac)")
+        else:
+            print(f"\n[Step 6] Multiwfn RESP + antechamber ...")
+            # 6a. Multiwfn RESP 拟合 (capped 体系)
+            capped_charges = run_multiwfn_resp(molden, cfg, workdir)
+            if capped_charges is None:
+                print("  [ERROR] RESP 拟合失败!")
+                sys.exit(1)
+
+            # 6b. 提取残基原子电荷 (去除 ACE/NME)
+            res_charges = {}
+            for ci in range(na, na + nr):
+                if ci in capped_charges:
+                    res_charges[ci - na] = capped_charges[ci]
+            res_total = sum(res_charges.values())
+            expected_q = cfg.get("residue_charge", cfg["net_charge"])
+            if abs(res_total - expected_q) > 0.0001:
+                corr = (expected_q - res_total) / len(res_charges)
+                for k in res_charges:
+                    res_charges[k] += corr
+            print(f"  残基 RESP 电荷: {len(res_charges)} 原子, 总计 {sum(res_charges.values()):.4f}")
+
+            # 6c. antechamber 生成 .ac (GAFF2 atom types)
+            # 用 bare PDB + gas 电荷 → 替换为 RESP
+            res_file = cfg["residue_file"]
+            mol2_tmp = os.path.join(workdir, f"{rn}_tmp.mol2")
+            ac_cmd = cfg.get("antechamber", "antechamber")
+            cmd = (f"{ac_cmd} -i {res_file} -fi pdb "
+                   f"-o {mol2_tmp} -fo mol2 -at gaff2 "
+                   f"-nc {cfg['net_charge']} -c gas -rn {rn} -pf y")
+            rc, _, err = _run_cmd(cmd, cwd=workdir)
+            if rc != 0:
+                raise RuntimeError(f"antechamber 失败:\n{err}")
+
+            # 替换 mol2 中的电荷
+            with open(mol2_tmp) as f:
+                lines = f.readlines()
+            in_atom, new_lines, aidx = False, [], 0
+            for line in lines:
+                if "@<TRIPOS>ATOM" in line:
+                    in_atom = True; new_lines.append(line); continue
+                if in_atom and line.startswith("@"):
+                    in_atom = False; new_lines.append(line); continue
+                if in_atom and line.strip():
+                    parts = line.split()
+                    if len(parts) >= 9 and aidx in res_charges:
+                        parts[8] = f"{res_charges[aidx]:.6f}"
+                        line = (f"{parts[0]:>7s} {parts[1]:<8s}"
+                                f"{float(parts[2]):>10.4f}{float(parts[3]):>10.4f}"
+                                f"{float(parts[4]):>10.4f} "
+                                f"{parts[5]:<8s}{parts[6]:>3s} {parts[7]:<8s}"
+                                f"{float(parts[8]):>10.6f}\n")
+                    aidx += 1
+                new_lines.append(line)
+            with open(mol2_tmp, 'w') as f:
+                f.writelines(new_lines)
+
+            # mol2 → ac (with RESP charges)
+            cmd = (f"{ac_cmd} -i {mol2_tmp} -fi mol2 "
+                   f"-o {rn}.ac -fo ac -at gaff2 "
+                   f"-nc {cfg['net_charge']} -c rc -rn {rn} -pf y")
+            rc, _, err = _run_cmd(cmd, cwd=workdir)
+            if rc != 0:
+                raise RuntimeError(f"antechamber mol2→ac 失败:\n{err}")
+            print(f"  .ac: {ac_file}")
+
     else:
-        print(f"\n[Step 6] antechamber RESP 拟合 ...")
-        if os.path.dirname(os.path.abspath(actual_log)) != workdir:
-            import shutil
-            shutil.copy2(actual_log, workdir)
-            actual_log = os.path.join(workdir, os.path.basename(actual_log))
-        run_antechamber(actual_log, cfg, workdir)
-        print(f"  .ac: {ac_file}")
+        # --- Gaussian 后端 ---
+        # Step 4: Gaussian 输入
+        if os.path.exists(com):
+            print(f"\n[Step 4] 跳过 (已有 {rn}.com)")
+        else:
+            print(f"\n[Step 4] Gaussian 输入 (Opt + --Link1-- SP ESP) ...")
+            elems, coords = read_xyz(xyz_mmff)
+            write_gaussian_input(com, elems, coords, cfg)
+            print(f"  文件: {com}")
+            print(f"  Job1: Opt {opt_method}")
+            print(f"  Job2: SP  {resp_method} Pop=MK IOp(6/33=2)")
+            print(f"  nproc={cfg.get('nproc', 16)}  mem={cfg.get('mem', '64GB')}")
+
+        # Step 5: 运行 Gaussian
+        done, actual_log = _gaussian_done(log)
+        if done:
+            print(f"\n[Step 5] 跳过 (Gaussian 已正常结束: {os.path.basename(actual_log)})")
+        else:
+            print(f"\n[Step 5] 运行 Gaussian ...")
+            if os.path.exists(log) and os.path.getsize(log) > 0:
+                content = open(log).read()
+                if "Error termination" in content:
+                    print(f"  检测到上次 Error termination, 删除旧 log 重新提交 ...")
+                    os.remove(log)
+                    chk = log.replace('.log', '.chk')
+                    if os.path.exists(chk):
+                        os.remove(chk)
+            actual_log = run_gaussian(com, cfg)
+            ok, actual_log = monitor_gaussian(actual_log, cfg.get("check_interval", 60))
+            if not ok:
+                print("Gaussian 失败, 请检查后重新运行.")
+                sys.exit(1)
+
+        # Step 6: antechamber RESP
+        if os.path.exists(ac_file):
+            print(f"\n[Step 6] 跳过 (已有 {rn}.ac)")
+        else:
+            print(f"\n[Step 6] antechamber RESP 拟合 ...")
+            if os.path.dirname(os.path.abspath(actual_log)) != workdir:
+                import shutil
+                shutil.copy2(actual_log, workdir)
+                actual_log = os.path.join(workdir, os.path.basename(actual_log))
+            run_antechamber(actual_log, cfg, workdir)
+            print(f"  .ac: {ac_file}")
 
     ac_names = read_ac_names(ac_file)
     ace_ac = ac_names[:na]
